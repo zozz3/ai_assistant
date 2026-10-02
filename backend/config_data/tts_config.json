@@ -1,0 +1,11 @@
+{
+  "provider": "dashscope",
+  "api_key": "sk-ws-H.PLXIHRL.bZFv.MEQCIBhrt65qpn_zwrI_v9wfWOIaJgS7LU-AQRM2XtWcS0pXAiBjShUCSDuoqb4fgtpByYzaZs7tpFx4pbhAxD1KuCy6eA",
+  "model": "qwen-audio-3.0-tts-flash",
+  "voice": "longanhuan_v3.6",
+  "format": "mp3",
+  "sample_rate": 24000,
+  "speech_rate": 1.3,
+  "pitch_rate": 0.9,
+  "workspace_id": ""
+}

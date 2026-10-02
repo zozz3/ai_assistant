@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+  <body>
+    <h1>WS 测试</h1>
+    <div id="log"></div>
+    <script>
+      const log = document.getElementById('log')
+      const ws = new WebSocket('ws://localhost:8000/api/chat/stream')
+      ws.onopen = () => {
+        log.innerHTML += '<p>✅ onopen</p>'
+        ws.send(JSON.stringify({type:'start', session_id:'btest', language:'en'}))
+      }
+      ws.onmessage = (e) => {
+        log.innerHTML += `<p>📨 ${e.data}</p>`
+      }
+      ws.onerror = (e) => {
+        log.innerHTML += `<p>❌ onerror: ${JSON.stringify(e)}</p>`
+      }
+      ws.onclose = (e) => {
+        log.innerHTML += `<p>🔌 onclose code=${e.code}</p>`
+      }
+    </script>
+  </body>
+</html>

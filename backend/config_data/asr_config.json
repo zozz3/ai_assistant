@@ -1,0 +1,12 @@
+{
+  "enable_streaming": true,
+  "semantic_punctuation_enabled": false,
+  "sample_rate": 16000,
+  "api_key": "sk-ws-H.PLXIHRL.bZFv.MEQCIBhrt65qpn_zwrI_v9wfWOIaJgS7LU-AQRM2XtWcS0pXAiBjShUCSDuoqb4fgtpByYzaZs7tpFx4pbhAxD1KuCy6eA",
+  "format": "wav",
+  "language": "en",
+  "model": "qwen-audio-3.1-asr-flash",
+  "streaming_model": "qwen-audio-3.0-asr-flash-streaming",
+  "provider": "dashscope",
+  "workspace_id": "ws-9u11sow24b78mx0w"
+}

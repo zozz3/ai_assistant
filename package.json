@@ -1,0 +1,25 @@
+{
+  "name": "english-speaking-coach",
+  "version": "1.0.0",
+  "description": "AI-powered English speaking practice application with voice recognition, LLM dialogue, and digital avatar",
+  "scripts": {
+    "setup": "cd backend && python -m venv venv && ./venv/Scripts/activate && pip install -r requirements.txt && cd ../frontend && npm install",
+    "dev": "npm run dev",
+    "dev:backend": "cd backend && ./venv/Scripts/activate && uvicorn main:app --reload",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "docker-compose up",
+    "clean": "rm -rf backend/venv frontend/node_modules"
+  },
+  "keywords": [
+    "english-learning",
+    "ai-coach",
+    "speech-recognition",
+    "tts",
+    "digital-avatar",
+    "react",
+    "fastapi"
+  ],
+  "author": "",
+  "license": "MIT"
+}
