@@ -1,5 +1,5 @@
 {
-  "system_prompt": "test",
+  "system_prompt": "现在是口语环境，模拟真实的环境",
   "model": "deepseek-flash",
   "provider": "openai",
   "temperature": 0.7,

@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime as _dt
@@ -895,6 +896,72 @@ async def upload_audio(
 # 句子边界标点（中英混合 + 换行）
 _SENTENCE_DELIMS = set(".!?。！？\n")
 
+# ✅ <grammar>...</grammar> 块（LLM 内部纠错协议，用户永远不该看到 / 听到）
+_GRAMMAR_BLOCK_RE = re.compile(r"<grammar>[\s\S]*?<\/grammar>", re.IGNORECASE)
+_GRAMMAR_OPEN_RE = re.compile(r"<grammar>[\s\S]*$", re.IGNORECASE)
+_GRAMMAR_JSON_RE = re.compile(r"<grammar>\s*([\s\S]*?)\s*<\/grammar>", re.IGNORECASE)
+
+
+def _strip_grammar_block(text: str) -> str:
+    """
+    从 LLM 回复里剥离 <grammar>...</grammar> 块，只留自然语言正文。
+
+    ✅ 用途：TTS 合成 / 数字人朗读的文本。
+    数字人绝不能把纠错 JSON（original/corrected/explanation）念出来，
+    所以送 TTS 之前必须用这个函数清理。
+    """
+    if not text:
+        return ""
+    out = _GRAMMAR_BLOCK_RE.sub("", text)
+    # 容错：流式输出被截断 / 模型没写闭标签
+    out = _GRAMMAR_OPEN_RE.sub("", out)
+    return out.strip()
+
+
+def _extract_grammar_checks(text: str) -> Optional[list]:
+    """
+    从 LLM 回复里抽出 grammar 纠错列表（供后端落库 meta）。
+
+    返回 list[dict] 或 None（无 grammar 块 / 解析失败）。
+    """
+    if not text:
+        return None
+    m = _GRAMMAR_JSON_RE.search(text)
+    if not m:
+        # 容错：未闭合
+        m2 = re.search(r"<grammar>\s*([\s\S]*)$", text, re.IGNORECASE)
+        if not m2:
+            return None
+        m = m2
+    body = (m.group(1) or "").strip()
+    if not body:
+        return []
+    for candidate in (body, re.sub(r",\s*([\]}])", r"\1", body)):
+        try:
+            arr = json.loads(candidate)
+        except Exception:
+            continue
+        if not isinstance(arr, list):
+            return None
+        out = []
+        for item in arr:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("original"), str)
+                and isinstance(item.get("corrected"), str)
+                and isinstance(item.get("explanation"), str)
+            ):
+                out.append(
+                    {
+                        "original": item["original"],
+                        "corrected": item["corrected"],
+                        "explanation": item["explanation"],
+                    }
+                )
+        return out
+    logger.warning(f"[Pipeline] grammar JSON 解析失败: {body[:120]}")
+    return None
+
 
 def _split_into_sentences(buffer: str):
     """
@@ -1041,6 +1108,7 @@ async def _run_pipeline_after_user_text(
             if not force and (now - last_delta_push) < delta_throttle_sec:
                 return
             try:
+                # ✅ 原样推 LLM 增量：grammar JSON 需要完整传给前端解析成纠错卡片
                 await _send_event(websocket, PipelineEvent(
                     type=PipelineEventType.LLM_DELTA, text=pending_delta,
                 ))
@@ -1068,7 +1136,9 @@ async def _run_pipeline_after_user_text(
             type=PipelineEventType.LLM_DONE,
         ))
 
-        # 4. 写入 assistant 历史（带滑动窗口裁剪）
+        # 4. 写入 assistant 历史
+        # ✅ 完整原文（含 <grammar> 块）写入历史，前端收到 pipeline_done 后
+        #    解析出干净正文 + 纠错列表分别渲染/朗读
         reply_text = "".join(full_reply).strip()
         _append_history_and_trim(session_id, ChatMessage(role="assistant", content=reply_text))
 
@@ -1091,27 +1161,32 @@ async def _run_pipeline_after_user_text(
 @router.websocket("/chat/stream")
 async def chat_stream_ws(websocket: WebSocket):
     """
-    端到端对话管道（批量 ASR 版本）。
+    端到端对话管道（流式 ASR 版本）。
 
     内部状态机：
-      start  → 初始化（无 ASR 会话）
-      audio  → 累积音频帧到 buffer
-      stop   → 整段音频发给批量 ASR → LLM + TTS → 完成
+      start  → 初始化流式 ASR 会话
+      audio  → 实时推送 PCM 帧给流式 ASR
+      stop   → 停止 ASR → LLM + TTS → 完成
+
+    流式 ASR 优势：边录边识别，延迟从 2-5s 降到 300-800ms
     """
     await websocket.accept()
     session_id: Optional[str] = None
     ws_workspace_id: Optional[str] = None
     ws_api_key: Optional[str] = None
-    ws_asr_model: str = "qwen-audio-3.1-asr-flash"
+    ws_asr_model: str = "qwen-audio-3.0-asr-flash-streaming"  # 改用流式模型
     language: str = "en"
-    audio_buffer: List[bytes] = []  # 累积 PCM 帧
     loop = asyncio.get_running_loop()
     ws_closed = False
-    # ✅ 严格一问一答：pipeline 跑起来后到 pipeline_done 之间，丢弃所有 audio / start，
-    # 防止前端用户手势造成"上一轮没处理完又叠加下一轮音频"。
     pipeline_busy: bool = False
-    # ✅ 场景 ID：每次 start 时从前端传来，拼到 LLM system_prompt 前
     ws_scene_id: str = "daily"
+
+    # 流式 ASR 会话
+    stream_session: Optional[StreamASRSession] = None
+    # 累积识别文本（实时更新）
+    asr_text_buffer: List[str] = []
+    asr_partial: str = ""
+    asr_lock: asyncio.Lock = asyncio.Lock()
 
     async def emit(event: PipelineEvent):
         nonlocal ws_closed
@@ -1121,6 +1196,53 @@ async def chat_stream_ws(websocket: WebSocket):
             await websocket.send_text(event.model_dump_json(exclude_none=True))
         except Exception:
             ws_closed = True
+
+    # 流式 ASR 回调函数（在 dashscope 子线程中执行）
+    def _on_partial(text: str):
+        nonlocal asr_partial
+        asyncio.run_coroutine_threadsafe(
+            _update_asr_partial(text),
+            loop,
+        )
+
+    def _on_sentence_end(text: str):
+        asyncio.run_coroutine_threadsafe(
+            _update_asr_sentence(text),
+            loop,
+        )
+
+    def _on_open():
+        asyncio.run_coroutine_threadsafe(
+            _send_asr_open(),
+            loop,
+        )
+
+    def _on_close():
+        pass  # 由 stop 逻辑统一处理
+
+    def _on_error(err_msg: str):
+        asyncio.run_coroutine_threadsafe(
+            emit(PipelineEvent(type=PipelineEventType.ERROR, message=f"ASR 错误: {err_msg}")),
+            loop,
+        )
+
+    async def _update_asr_partial(text: str):
+        nonlocal asr_partial
+        async with asr_lock:
+            asr_partial = text
+        # 实时推送给前端
+        await emit(PipelineEvent(type=PipelineEventType.ASR_PARTIAL, text=text))
+
+    async def _update_asr_sentence(text: str):
+        nonlocal asr_partial
+        async with asr_lock:
+            asr_text_buffer.append(text)
+            asr_partial = ""
+        # 推送给前端
+        await emit(PipelineEvent(type=PipelineEventType.ASR_SENTENCE_END, text=text))
+
+    async def _send_asr_open():
+        await emit(PipelineEvent(type=PipelineEventType.AVATAR_STATE, state="listening"))
 
     try:
         await emit(PipelineEvent(type=PipelineEventType.READY))
@@ -1152,14 +1274,14 @@ async def chat_stream_ws(websocket: WebSocket):
             if mtype == "start":
                 session_id = msg.get("session_id") or f"chat_{uuid.uuid4().hex[:12]}"
                 language = msg.get("language", "en")
-                audio_buffer.clear()
-                # ✅ 同一连接内新一轮录音前，重置 busy 锁 + 清掉旧 audio_buffer
                 pipeline_busy = False
-                # ✅ 场景 ID（前端传来的场景选择，注入对应 system prompt）
                 ws_scene_id = msg.get("scene_id", "daily")
-                logger.info(f"[ChatStream] start, session={session_id}, scene={ws_scene_id}")
-                # ---- 关键修复：从 config_service（前端设置页保存的）读 ASR 凭证，
-                # 而不是 .env 里的占位 DASHSCOPE_API_KEY ----
+
+                # 清空上一轮的数据
+                asr_text_buffer.clear()
+                asr_partial = ""
+
+                # 获取 ASR 配置
                 asr_cfg = _get_runtime_asr_config()
                 ws_api_key = (asr_cfg.get("api_key") or "").strip() or None
                 ws_workspace_id = (
@@ -1168,110 +1290,120 @@ async def chat_stream_ws(websocket: WebSocket):
                     or os.getenv("DASHSCOPE_WORKSPACE_ID")
                     or None
                 )
-                ws_asr_model = (
-                    msg.get("model")
-                    or asr_cfg.get("model")
-                    or "qwen-audio-3.1-asr-flash"
-                )
+                # ✅ 强制使用流式 ASR 模型
+                ws_asr_model = "qwen-audio-3.0-asr-flash-streaming"
+
                 if ws_api_key:
-                    # 让 dashscope 在子线程中也能拿到 key（双保险）
                     os.environ["DASHSCOPE_API_KEY"] = ws_api_key
                     try:
                         import dashscope as _ds
                         _ds.api_key = ws_api_key
                     except Exception:
                         pass
+
                 logger.info(
-                    f"[ChatStream] session start, "
-                    f"key_set={bool(ws_api_key)}, "
-                    f"ws_workspace_id={ws_workspace_id!r}, model={ws_asr_model}"
+                    f"[ChatStream] 流式 ASR 启动, session={session_id}, "
+                    f"model={ws_asr_model}, lang={language}"
                 )
-                # ---- 关键修复：刷新 LLM/TTS 的运行时配置（前端设置页保存的），
-                # 否则它们会一直用 .env 的占位 DASHSCOPE_API_KEY / OPENAI_API_KEY ----
+
+                # ✅ 创建流式 ASR 会话（实时识别，不需要等 stop）
+                try:
+                    stream_session = StreamASRSession(
+                        on_partial=_on_partial,
+                        on_sentence_end=_on_sentence_end,
+                        on_complete=lambda: None,
+                        on_error=_on_error,
+                        on_open=_on_open,
+                        on_close=_on_close,
+                        model=ws_asr_model,
+                        format="pcm",
+                        sample_rate=16000,
+                        language=language,
+                        workspace_id=ws_workspace_id,
+                        api_key=ws_api_key,
+                    )
+                    stream_session.start()
+                    logger.info(f"[ChatStream] 流式 ASR WebSocket 已建立")
+                except Exception as e:
+                    logger.exception("[ChatStream] 启动流式 ASR 失败")
+                    await emit(PipelineEvent(
+                        type=PipelineEventType.ERROR,
+                        message=f"ASR 启动失败: {e}",
+                    ))
+                    stream_session = None
+
+                # 刷新 LLM/TTS 配置
                 try:
                     llm_service.reload_runtime_config()
-                except Exception as e:
-                    logger.warning(f"[ChatStream] reload llm_runtime_config failed: {e}")
-                try:
                     tts_service.reload_runtime_config()
                 except Exception as e:
-                    logger.warning(f"[ChatStream] reload tts_runtime_config failed: {e}")
+                    logger.warning(f"[ChatStream] reload config failed: {e}")
+
                 await emit(PipelineEvent(
                     type=PipelineEventType.AVATAR_STATE, state="listening",
                 ))
                 continue
 
             if mtype == "audio":
+                if not stream_session:
+                    continue
                 data_b64 = msg.get("data")
                 if not data_b64:
                     continue
-                # ✅ pipeline 跑起来时拒绝新音频（防 race：用户在前一轮未完成时按下麦克风）
-                if pipeline_busy:
-                    logger.debug(
-                        f"[ChatStream] audio dropped while pipeline_busy session={session_id}"
-                    )
-                    continue
                 try:
                     raw_bytes = base64.b64decode(data_b64)
-                    audio_buffer.append(raw_bytes)
+                    # ✅ 实时发送给流式 ASR（边录边识别）
+                    stream_session.send_audio_frame(raw_bytes)
                 except Exception as e:
-                    logger.warning(f"[ChatStream] audio decode err: {e}")
+                    logger.warning(f"[ChatStream] audio frame error: {e}")
                 continue
 
             if mtype == "stop":
-                # ✅ stop 也受 pipeline_busy 保护：避免重复 stop 触发新一轮 ASR
                 if pipeline_busy:
                     logger.warning(
                         f"[ChatStream] stop dropped while pipeline_busy session={session_id}"
                     )
                     continue
                 pipeline_busy = True
+
                 try:
-                    # 合并所有音频帧
-                    full_audio = b"".join(audio_buffer)
-                    audio_buffer.clear()
-                    logger.info(
-                        f"[ChatStream] stop: collected {len(full_audio)} bytes of audio"
-                    )
-                    remove_stream_session(f"asr_{session_id}")
+                    # 1) 停止流式 ASR，获取最终识别结果
+                    final_text = ""
+                    if stream_session:
+                        try:
+                            stream_session.stop(wait_complete=True, timeout=3.0)
+                        except Exception:
+                            pass
+                        final_text = stream_session.get_full_text() or ""
 
-                    if not full_audio:
-                        await emit(PipelineEvent(
-                            type=PipelineEventType.ERROR,
-                            message="未录制到音频",
-                        ))
-                        await emit(PipelineEvent(
-                            type=PipelineEventType.PIPELINE_DONE,
-                        ))
-                        continue
+                    # 合并累积的句子
+                    async with asr_lock:
+                        full_text = " ".join(asr_text_buffer)
+                        if asr_partial:
+                            if full_text:
+                                full_text += " " + asr_partial
+                            else:
+                                full_text = asr_partial
 
-                    # 调用批量 ASR（同步式，OpenAI 兼容接口）
-                    # ---- 关键修复：把 config_service 里的 key 传给 ASRService 实例，
-                    # 否则它会用 .env 里那个占位值，永远 401 / 不消耗额度 ----
-                    from services.asr_service import ASRService as _ASRService
-                    runtime_asr = _ASRService(api_key=ws_api_key)
-                    if ws_asr_model:
-                        runtime_asr.model = ws_asr_model
-                    try:
-                        user_text = await runtime_asr.recognize_batch(
-                            audio_bytes=full_audio,
-                            format="wav",  # 前端发的 PCM 可以当 wav
-                            sample_rate=16000,
-                            language=language,
-                            model=ws_asr_model,
-                            workspace_id=ws_workspace_id,
-                        )
-                    except Exception as e:
-                        logger.exception("[ChatStream] batch ASR exception")
-                        user_text = None
+                    # 如果 get_full_text 为空，用累积的
+                    if not final_text.strip():
+                        final_text = full_text.strip()
 
+                    logger.info(f"[ChatStream] ASR 识别完成: {final_text!r}")
+
+                    # 发送最终识别结果
                     await emit(PipelineEvent(
                         type=PipelineEventType.USER_TEXT_FINAL,
                         session_id=session_id,
-                        text=user_text or "",
+                        text=final_text,
                     ))
 
-                    if not user_text:
+                    # 清理流式 ASR 会话
+                    if stream_session:
+                        remove_stream_session(f"asr_{session_id}")
+                        stream_session = None
+
+                    if not final_text.strip():
                         await emit(PipelineEvent(
                             type=PipelineEventType.ERROR,
                             message="未识别到任何内容",
@@ -1279,12 +1411,13 @@ async def chat_stream_ws(websocket: WebSocket):
                         await emit(PipelineEvent(
                             type=PipelineEventType.PIPELINE_DONE,
                         ))
+                        pipeline_busy = False
                         continue
 
-                    # 跑 LLM + TTS 管道
+                    # 2) 跑 LLM + TTS 管道
                     try:
                         await _run_pipeline_after_user_text(
-                            user_text=user_text,
+                            user_text=final_text,
                             session_id=session_id,
                             websocket=websocket,
                             scene_id=ws_scene_id,
@@ -1299,7 +1432,6 @@ async def chat_stream_ws(websocket: WebSocket):
                             type=PipelineEventType.PIPELINE_DONE,
                         ))
                 finally:
-                    # ✅ 无论成功失败都释放锁，让前端可以发起下一轮
                     pipeline_busy = False
                 continue
 
@@ -1318,3 +1450,13 @@ async def chat_stream_ws(websocket: WebSocket):
             ))
         except Exception:
             pass
+    finally:
+        # 清理流式 ASR 会话
+        if stream_session:
+            try:
+                stream_session.stop()
+            except Exception:
+                pass
+            if session_id:
+                remove_stream_session(session_id)
+                stream_session = None

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Avatar } from './components/Avatar'
 import { VoiceInput } from './components/VoiceInput'
 import { ChatInterface } from './components/ChatInterface'
@@ -19,20 +19,34 @@ type AppView = 'main' | 'settings'
  * 规则：
  *  - 标签内必须是合法 JSON 数组
  *  - 解析失败时返回原文 + 空数组
+ *  - ✅ 容错：模型只输出开标签没闭合 → 也能剥离并尝试解析
  */
 function parseGrammarBlock(
   raw: string
 ): { cleanText: string; grammarChecks: GrammarCheckItem[] } {
   if (!raw) return { cleanText: '', grammarChecks: [] }
   const match = raw.match(/<grammar>([\s\S]*?)<\/grammar>/i)
-  if (!match) return { cleanText: raw.trim(), grammarChecks: [] }
+  if (!match) {
+    // ✅ 兜底：只有开标签没有闭标签（流式被截断 / 模型没写闭标签）
+    const dangling = raw.match(/<grammar>([\s\S]*)$/i)
+    if (dangling) {
+      const cleanText = raw.replace(/<grammar>[\s\S]*$/gi, '').trim()
+      return { cleanText, grammarChecks: parseGrammarJson(dangling[1]) }
+    }
+    return { cleanText: raw.trim(), grammarChecks: [] }
+  }
   const cleanText = raw.replace(/<grammar>[\s\S]*?<\/grammar>/gi, '').trim()
-  const json = match[1].trim()
-  if (!json) return { cleanText, grammarChecks: [] }
-  try {
-    const arr = JSON.parse(json)
-    if (!Array.isArray(arr)) return { cleanText, grammarChecks: [] }
-    const checks: GrammarCheckItem[] = arr
+  return { cleanText, grammarChecks: parseGrammarJson(match[1]) }
+}
+
+/** 解析 <grammar> 块内的 JSON 数组；容错常见 LLM 格式错误 */
+function parseGrammarJson(json: string): GrammarCheckItem[] {
+  if (!json) return []
+  const body = json.trim()
+  if (!body) return []
+  const normalize = (arr: unknown): GrammarCheckItem[] => {
+    if (!Array.isArray(arr)) return []
+    return arr
       .filter(
         (x) =>
           x &&
@@ -45,11 +59,36 @@ function parseGrammarBlock(
         corrected: x.corrected,
         explanation: x.explanation,
       }))
-    return { cleanText, grammarChecks: checks }
-  } catch (e) {
-    console.warn('[parseGrammarBlock] JSON 解析失败:', e, json.slice(0, 100))
-    return { cleanText, grammarChecks: [] }
   }
+  try {
+    return normalize(JSON.parse(body))
+  } catch (e) {
+    console.warn('[parseGrammarBlock] JSON 解析失败，尝试修复:', e)
+    try {
+      // 常见错误：结尾多余逗号
+      return normalize(JSON.parse(body.replace(/,\s*([\]}])/g, '$1')))
+    } catch {
+      return []
+    }
+  }
+}
+
+/**
+ * ✅ 剥离 <grammar> 块，用于**实时预览气泡**（不是最终消息）
+ *
+ * 重要区分：
+ *  - 最终消息气泡：正文显示 cleanText，纠错以卡片形式渲染在【用户消息下方】
+ *  - 实时预览气泡（VoiceInput）：只是"AI 正在说"的打字机预览，
+ *    如果显示 grammar JSON 会很难看，所以这里剥离
+ *  - TTS / 数字人朗读：必须剥离，否则会把 JSON 念出来
+ */
+function stripGrammarBlock(raw: string): string {
+  if (!raw) return ''
+  // 完整块
+  let out = raw.replace(/<grammar>[\s\S]*?<\/grammar>/gi, '')
+  // 未闭合的（正在流式输出 grammar JSON 时）
+  out = out.replace(/<grammar>[\s\S]*$/gi, '')
+  return out.trim()
 }
 
 function App() {
@@ -74,6 +113,13 @@ function App() {
   const [isInitialized, setIsInitialized] = useState(false)
   const [currentView, setCurrentView] = useState<AppView>('main')
   const [historyOpen, setHistoryOpen] = useState(false)
+
+  // ✅ 历史恢复时暂存 grammar 纠错：assistant 消息里带 <grammar> 块，
+  // 需要解析后挂到它【前面那条 user 消息】上。setMessages 是整体替换，
+  // 所以必须先收集再二次 setMessageGrammarCheck。
+  const historyGrammarRef = useRef<
+    { userIndex: number; checks: GrammarCheckItem[] }[]
+  >([])
 
   // ===== 流式对话管道 =====
   // ✅ 关键改动：后端不再推 tts_chunk，TTS 由前端在收到 pipeline_done 后独立完成：
@@ -187,8 +233,10 @@ function App() {
 
       try {
         // 2) 前端主动调 TTS（独立 HTTP 路径）
-        console.log('[App] → 调用 /api/config/tts/synthesize 合成完整文本')
-        const result = await api.synthesizeText(replyText.trim())
+        // ✅ 关键修复：必须用 cleanText（已剥离 <grammar> 块），否则数字人会把
+        // 原始 JSON（original/corrected/explanation）当正文念出来
+        console.log('[App] → 调用 /api/config/tts/synthesize 合成干净文本')
+        const result = await api.synthesizeText(cleanText.trim())
         if (!result.success || !result.audio_data) {
           console.error('[App] synthesizeText 失败:', result.error)
           setError(`自动播报失败：${result.error || 'TTS 合成失败'}`)
@@ -258,13 +306,43 @@ function App() {
           const msgs = (histResp as any)?.messages || []
           if (Array.isArray(msgs) && msgs.length > 0) {
             setMessages(
-              msgs.map((m: any, i: number) => ({
-                id: `hist-${session_id}-${i}-${m.timestamp || ''}`,
-                role: m.role === 'assistant' ? 'assistant' : 'user',
-                content: m.content || '',
-                timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
-              }))
+              msgs.map((m: any, i: number) => {
+                const raw = m.content || ''
+                // ✅ 历史里的 assistant 消息可能含 <grammar> 块（后端完整存了原文），
+                // 直接渲染会出现裸 JSON。这里解析出干净正文 + 纠错列表，
+                // 纠错按位置挂回它前面的那条 user 消息。
+                if (m.role === 'assistant') {
+                  const { cleanText, grammarChecks } = parseGrammarBlock(raw)
+                  if (grammarChecks.length > 0) {
+                    historyGrammarRef.current.push({
+                      userIndex: i - 1, // grammar 挂在前一条 user 上
+                      checks: grammarChecks,
+                    })
+                  }
+                  return {
+                    id: `hist-${session_id}-${i}-${m.timestamp || ''}`,
+                    role: 'assistant' as const,
+                    content: cleanText,
+                    timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+                  }
+                }
+                return {
+                  id: `hist-${session_id}-${i}-${m.timestamp || ''}`,
+                  role: 'user' as const,
+                  content: raw,
+                  timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+                }
+              })
             )
+            // ✅ 把历史里的纠错挂到对应的 user 消息上
+            const withChecks = useChatStore.getState().messages
+            for (const entry of historyGrammarRef.current) {
+              const target = withChecks[entry.userIndex]
+              if (target && target.role === 'user') {
+                setMessageGrammarCheck(target.id, entry.checks)
+              }
+            }
+            historyGrammarRef.current = []
             console.log(`[App] 恢复了 ${msgs.length} 条历史消息`)
 
             // ✅ 并行从 IDB 恢复每条 assistant 的音频
@@ -302,6 +380,7 @@ function App() {
       setSessionId,
       setMessages,
       setMessageAudioUrl,
+      setMessageGrammarCheck,
       setLoading,
       setError,
     ]
@@ -617,7 +696,7 @@ function App() {
                 onStop={handleVoiceStop}
                 onError={handleError}
                 interimText={interimText}
-                llmText={llmText}
+                llmText={stripGrammarBlock(llmText)}
                 avatarState={avatarState}
                 disabled={!isInitialized}
               />

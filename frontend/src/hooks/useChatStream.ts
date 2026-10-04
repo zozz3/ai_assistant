@@ -284,6 +284,12 @@ export const useChatStream = (opts: UseChatStreamOptions = {}): UseChatStreamRet
         }
         case 'pipeline_done':
           setIsPipelineRunning(false)
+          // ✅ 关键：AI 说完了 → 清空临时气泡。
+          // 之前 llmText 只在 llm_start 清空，导致「正在听 / AI 正在说」那块
+          // 实时预览会一直挂到下一轮录音才消失。
+          // 最终正文 + 纠错卡片已经渲染进 ChatInterface 的消息列表了，这里只需清场。
+          setInterimText('')
+          setLlmText('')
           cbPipelineDoneRef.current?.(ev.text || '')
           break
         case 'error':
