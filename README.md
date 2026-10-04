@@ -2,6 +2,29 @@
 
 English Speaking Coach 是一个基于 AI 的英语口语陪练应用，集成了语音识别、LLM 对话、语音合成和数字人形象驱动。
 
+## 📹 演示视频
+
+演示应用的完整对话流程：**麦克风录音 → ASR 语音识别 → LLM 对话处理 → TTS 语音合成 → 数字人形象驱动输出**
+
+🎬 **[点击播放演示视频 (test.mp4)](test.mp4)**
+
+<details>
+<summary>在页面内直接播放（浏览器支持 video 标签时可用）</summary>
+
+```html
+<video src="https://github.com/zozz3/ai_assistant/raw/master/test.mp4"
+       controls width="100%" preload="metadata">
+  你的浏览器不支持 video 标签，请
+  <a href="https://github.com/zozz3/ai_assistant/raw/master/test.mp4">点击这里下载视频</a>查看。
+</video>
+```
+
+</details>
+
+> 📥 视频文件约 74 MB，如浏览器无法直接播放，请
+> <a href="https://github.com/zozz3/ai_assistant/raw/master/test.mp4">点击此处下载</a>
+> 后用本地播放器打开。
+
 ## 功能特性
 
 - 🎤 **实时语音输入** - 使用麦克风进行语音输入
@@ -198,6 +221,7 @@ english-speaking-coach/
 ├── docker-compose.yml
 ├── start.sh
 ├── start.ps1
+├── test.mp4                # 演示视频
 └── README.md
 ```
 
